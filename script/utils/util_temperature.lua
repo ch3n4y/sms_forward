@@ -16,4 +16,8 @@ function get()
     return temperature
 end
 
+function cached()
+    return temperature
+end
+
 get()

@@ -26,6 +26,12 @@ local function initUsbNotifyUart()
         return false
     end
 
+    if _G.USB_UART3_READY then
+        usb_uart_ready = true
+        log.info("util_notify", "复用已初始化的 UART", USB_NOTIFY_UART_ID)
+        return true
+    end
+
     local ok, real_baud = pcall(uart.setup, USB_NOTIFY_UART_ID, 115200, 8, uart.PAR_NONE, uart.STOP_1)
     if not ok then
         log.error("util_notify", "初始化 USB 虚拟串口失败")
@@ -33,6 +39,7 @@ local function initUsbNotifyUart()
     end
 
     usb_uart_ready = true
+    _G.USB_UART3_READY = true
     log.info("util_notify", "USB 串口初始化成功", "uart_id:", USB_NOTIFY_UART_ID, "baud:", real_baud)
     return true
 end
@@ -367,9 +374,9 @@ local notify = {
             device_info_appended = config.NOTIFY_APPEND_MORE_INFO and true or false,
         }
         local payload = json.encode(body) .. getUsbNotifyEol()
-            log.info("util_notify", "UART", USB_NOTIFY_UART_ID, payload)
+        log.info("util_notify", "UART", USB_NOTIFY_UART_ID, payload)
 
-            local ok, result = pcall(uart.write, USB_NOTIFY_UART_ID, payload)
+        local ok, result = pcall(uart.write, USB_NOTIFY_UART_ID, payload)
         if not ok then
             log.error("util_notify", "USB 虚拟串口发送失败")
             usb_uart_ready = false

@@ -13,7 +13,13 @@
 #define WS_PORT 81
 #define MAX_RAW_LOG_CHARS 12000
 #define HOST_TIME_SYNC_INTERVAL_MS (60UL * 1000UL)
-#define STATUS_POLL_INTERVAL_MS (5UL * 1000UL)
+#define STATUS_POLL_INTERVAL_MS (30UL * 1000UL)
+#define STATUS_REQUEST_TIMEOUT_MS (15UL * 1000UL)
+#define STATUS_MIN_REQUEST_GAP_MS (8UL * 1000UL)
+#define DOWNSTREAM_OFFLINE_TIMEOUT_MS (90UL * 1000UL)
+#define BARK_QUEUE_SIZE 6
+#define BARK_SEND_INTERVAL_MS 1200UL
+#define BARK_HTTP_TIMEOUT_MS 5000
 #define WIFI_RETRY_COUNT 20
 #define WIFI_RETRY_DELAY_MS 500
 
@@ -37,8 +43,14 @@ struct BarkConfig {
   String key;
 };
 
+struct BarkQueueItem {
+  String message;
+  bool forceSend = false;
+};
+
 DeviceState deviceState;
 BarkConfig barkConfig;
+BarkQueueItem barkQueue[BARK_QUEUE_SIZE];
 String uartLineBuffer;
 String rawLogBuffer;
 String lastStatusMessage;
@@ -46,11 +58,24 @@ String webPassword;
 String sessionToken;
 unsigned long lastTimeSyncMs = 0;
 unsigned long lastStatusPollMs = 0;
+unsigned long lastStatusRequestMs = 0;
+unsigned long lastStatusReplyMs = 0;
+unsigned long lastDownstreamCommandMs = 0;
+unsigned long lastBarkSendMs = 0;
 bool downstreamOnline = false;
+bool statusRequestPending = false;
+String currentStatusRequestId;
+String lastStatusReplyId;
 unsigned long lastDownstreamMessageMs = 0;
 unsigned long rawLogSeq = 0;
 unsigned long deviceStateSeq = 0;
 unsigned long statusSeq = 0;
+unsigned long requestSeq = 0;
+unsigned long barkEnqueuedSeq = 0;
+unsigned long barkSentSeq = 0;
+uint8_t barkQueueHead = 0;
+uint8_t barkQueueTail = 0;
+uint8_t barkQueueCount = 0;
 
 String jsonEscape(const String &input) {
   String out;
@@ -181,6 +206,16 @@ void publishStatusMessage(const String &text) {
   publishRawLog("[STATUS] " + text);
 }
 
+String nextRequestId(const String &prefix) {
+  requestSeq++;
+  return prefix + "-" + String(requestSeq) + "-" + String(millis(), HEX);
+}
+
+long elapsedMsOrMinusOne(unsigned long mark, unsigned long now) {
+  if (mark == 0) return -1;
+  return (long)(now - mark);
+}
+
 void persistBarkConfig() {
   preferences.putBool("bark_enabled", barkConfig.enabled);
   preferences.putString("bark_api", barkConfig.api);
@@ -268,7 +303,7 @@ bool shouldForwardBark(const String &message) {
   return message.indexOf("#SMS") >= 0 || message.indexOf("#sms") >= 0 || message.indexOf("#CALL") >= 0 || message.indexOf("#call") >= 0;
 }
 
-void sendBark(const String &message, bool forceSend = false) {
+void sendBarkNow(const String &message, bool forceSend = false) {
   if (!forceSend && !shouldForwardBark(message)) return;
   String url = buildBarkUrl(barkConfig.api, barkConfig.key);
   if (url.isEmpty()) {
@@ -277,18 +312,49 @@ void sendBark(const String &message, bool forceSend = false) {
   }
   HTTPClient http;
   http.begin(url);
+  http.setTimeout(BARK_HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json; charset=utf-8");
   int code = http.POST(buildBarkPayload(message));
   String response = http.getString();
   if (code > 0 && code < 400) publishRawLog("[BARK] 转发成功 (" + String(code) + ")");
   else publishRawLog("[BARK] 转发失败 (" + String(code) + ") " + response);
   http.end();
+  barkSentSeq++;
+}
+
+bool enqueueBark(const String &message, bool forceSend = false) {
+  if (!forceSend && !shouldForwardBark(message)) return false;
+  if (barkQueueCount >= BARK_QUEUE_SIZE) {
+    publishRawLog("[BARK] 队列已满，丢弃新消息");
+    return false;
+  }
+  barkQueue[barkQueueTail].message = message;
+  barkQueue[barkQueueTail].forceSend = forceSend;
+  barkQueueTail = (barkQueueTail + 1) % BARK_QUEUE_SIZE;
+  barkQueueCount++;
+  barkEnqueuedSeq++;
+  publishRawLog("[BARK] 已加入发送队列，当前 " + String(barkQueueCount) + "/" + String(BARK_QUEUE_SIZE));
+  return true;
+}
+
+void processBarkQueue() {
+  if (barkQueueCount == 0) return;
+  unsigned long now = millis();
+  if (lastBarkSendMs != 0 && now - lastBarkSendMs < BARK_SEND_INTERVAL_MS) return;
+  BarkQueueItem item = barkQueue[barkQueueHead];
+  barkQueue[barkQueueHead].message = "";
+  barkQueue[barkQueueHead].forceSend = false;
+  barkQueueHead = (barkQueueHead + 1) % BARK_QUEUE_SIZE;
+  barkQueueCount--;
+  lastBarkSendMs = now;
+  sendBarkNow(item.message, item.forceSend);
 }
 
 void writeDownstreamLine(const String &line) {
   Serial1.print(line);
   Serial1.print("\r\n");
   Serial1.flush();
+  lastDownstreamCommandMs = millis();
   publishRawLog("[UART_TX] " + line);
 }
 
@@ -306,8 +372,10 @@ void sendTimeSync() {
   time_t now = time(nullptr);
   struct tm timeinfo;
   if (!localtime_r(&now, &timeinfo)) return;
+  String requestId = nextRequestId("time");
   String payload = String("{") +
                    "\"cmd\":\"sync_time\"," +
+                   "\"id\":\"" + jsonEscape(requestId) + "\"," +
                    "\"source\":\"esp32_web\"," +
                    "\"clock\":{" +
                    "\"year\":" + String(timeinfo.tm_year + 1900) + "," +
@@ -320,8 +388,37 @@ void sendTimeSync() {
   writeDownstreamLine(payload);
 }
 
-void requestDeviceStatus() { writeDownstreamLine("{\"cmd\":\"get_status\"}"); }
-void sendRebootCommand() { writeDownstreamLine("{\"cmd\":\"reboot\"}"); }
+bool statusRequestExpired(unsigned long now) {
+  return statusRequestPending && now - lastStatusRequestMs >= STATUS_REQUEST_TIMEOUT_MS;
+}
+
+bool requestDeviceStatus(bool force = false) {
+  unsigned long now = millis();
+  if (statusRequestExpired(now)) {
+    statusRequestPending = false;
+    publishRawLog("[STATUS] 上一次状态请求超时，允许重新查询");
+  }
+  if (statusRequestPending) {
+    publishRawLog("[STATUS] 已有状态请求等待回复，跳过本次查询");
+    return false;
+  }
+  if (!force && lastStatusRequestMs != 0 && now - lastStatusRequestMs < STATUS_MIN_REQUEST_GAP_MS) {
+    publishRawLog("[STATUS] 状态查询过于频繁，跳过本次查询");
+    return false;
+  }
+  String requestId = nextRequestId("status");
+  writeDownstreamLine("{\"cmd\":\"get_status\",\"id\":\"" + jsonEscape(requestId) + "\"}");
+  statusRequestPending = true;
+  currentStatusRequestId = requestId;
+  lastStatusRequestMs = now;
+  lastStatusPollMs = now;
+  return true;
+}
+
+void sendRebootCommand() {
+  String requestId = nextRequestId("reboot");
+  writeDownstreamLine("{\"cmd\":\"reboot\",\"id\":\"" + jsonEscape(requestId) + "\"}");
+}
 
 void clearDeviceState() {
   deviceState.phoneNumber = "";
@@ -338,7 +435,14 @@ void handleIncomingJsonLine(const String &line) {
   String message = extractJsonString(line, "message");
   String channel = extractJsonString(line, "channel");
   String timestamp = extractJsonString(line, "timestamp");
+  String replyId = extractJsonString(line, "id");
   if (event == "get_status") {
+    if (replyId.length() == 0 || replyId == currentStatusRequestId) {
+      statusRequestPending = false;
+      currentStatusRequestId = "";
+    }
+    lastStatusReplyId = replyId;
+    lastStatusReplyMs = millis();
     deviceState.phoneNumber = extractJsonString(line, "phone_number");
     deviceState.identityType = extractJsonString(line, "identity_type");
     deviceState.operatorName = extractJsonString(line, "operator");
@@ -350,7 +454,7 @@ void handleIncomingJsonLine(const String &line) {
     lastDownstreamMessageMs = millis();
     publishDeviceState();
   }
-  if (channel == "usb_uart" && message.length() && shouldForwardBark(message)) sendBark(message);
+  if (channel == "usb_uart" && message.length() && shouldForwardBark(message)) enqueueBark(message);
 }
 
 void handleIncomingLine(const String &line) {
@@ -424,7 +528,7 @@ String loginPage() {
 
 String htmlPage() {
   return R"rawliteral(
-<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Air724UG Web Monitor</title><style>:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;font-family:"Microsoft YaHei UI",sans-serif;background:#0f1115;color:#e8eaed}.wrap{max-width:1180px;margin:0 auto;padding:16px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.badge{padding:6px 10px;border-radius:999px;background:#1f2937;color:#cbd5e1;font-size:12px}.ok{background:#12361f;color:#86efac}.bad{background:#3a1616;color:#fca5a5}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:16px}.card{background:#171a21;border:1px solid #2a2f3a;border-radius:12px;padding:14px}.card h3{margin:0 0 10px;font-size:15px}.kv{display:grid;grid-template-columns:88px 1fr;gap:8px;font-size:14px;line-height:1.7}input,button,textarea{border-radius:8px;border:1px solid #394150;background:#0d1117;color:#e8eaed;padding:10px;font-size:14px}input,textarea{width:100%}button{cursor:pointer;background:#2563eb;border-color:#2563eb}button.secondary{background:#374151;border-color:#374151}button.warn{background:#b91c1c;border-color:#b91c1c}button:disabled{opacity:.55;cursor:not-allowed}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.status-line{margin-top:12px;padding:10px 12px;border-radius:10px;background:#111827;color:#cbd5e1;font-size:13px}.status-line.error{background:#3a1616;color:#fecaca}.status-line.ok{background:#12361f;color:#bbf7d0}#raw{height:360px;overflow:auto;white-space:pre-wrap;word-break:break-all;background:#05070b;border:1px solid #2a2f3a;border-radius:12px;padding:12px;font-family:Consolas,monospace}.muted{color:#94a3b8;font-size:12px}textarea{min-height:96px;resize:vertical}</style></head><body><div class="wrap"><div class="top"><div><h2 style="margin:0">Air724UG Web Monitor</h2><div class="muted">ESP32-C3 UART 网关 · GPIO20 RX / GPIO21 TX</div></div><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><span class="badge" id="wifiState">WiFi -</span><span class="badge bad" id="wsState">WebSocket 未连接</span><span class="badge" id="deviceStateBadge">下位机离线</span><button class="secondary" style="padding:8px 12px" onclick="logout()">退出登录</button></div></div><div id="statusLine" class="status-line">页面已加载，等待设备状态...</div><div class="grid"><div class="card"><h3>设备状态</h3><div class="kv"><div>号码/ICCID</div><div id="phone">-</div><div>身份类型</div><div id="identity">-</div><div>运营商</div><div id="operator">-</div><div>信号</div><div id="signal">-</div><div>温度</div><div id="temp">-</div><div>启动原因</div><div id="reason">-</div><div>更新时间</div><div id="updatedAt">-</div></div><div class="actions"><button id="btnRefresh" onclick="refreshStatus()">刷新状态</button><button id="btnSyncTime" class="secondary" onclick="syncTimeNow()">同步时间</button><button id="btnReboot" class="warn" onclick="rebootDownstream()">重启下位机</button></div></div><div class="card"><h3>Bark 配置</h3><label class="muted"><input type="checkbox" id="barkEnabled" style="width:auto;margin-right:8px">启用短信/来电转发</label><div style="height:10px"></div><input id="barkApi" placeholder="BARK_API，例如 https://bark.256404.xyz"><div style="height:10px"></div><input id="barkKey" placeholder="BARK_KEY"><div class="actions"><button id="btnSaveBark" onclick="saveBark()">保存 Bark</button><button id="btnTestBark" class="secondary" onclick="testBark()">测试 Bark</button></div></div><div class="card"><h3>网页密码</h3><div class="muted">修改后立即生效，当前会话保持登录</div><div style="height:10px"></div><input id="newPassword" type="password" placeholder="新密码"><div style="height:10px"></div><input id="confirmPassword" type="password" placeholder="确认新密码"><div class="actions"><button id="btnSavePassword" onclick="savePassword()">保存密码</button></div></div><div class="card"><h3>原始命令</h3><div class="muted">用于联调下位机，支持直接发送 JSON 行</div><div style="height:10px"></div><textarea id="commandText" spellcheck="false">{&quot;cmd&quot;:&quot;get_status&quot;}</textarea><div class="actions"><button id="btnSendCommand" onclick="sendCommand()">发送命令</button><button class="secondary" onclick="presetCommand('status')">填入 get_status</button><button class="secondary" onclick="presetCommand('time')">填入 sync_time</button></div></div></div><div class="card" style="margin-top:16px"><div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"><h3 style="margin:0">原始日志</h3><div class="actions" style="margin-top:0"><button class="secondary" onclick="clearRawLog()">清空日志</button></div></div><div class="muted" style="margin:8px 0 12px">显示 UART 收发、状态消息和 Bark 结果</div><div id="raw"></div></div></div><script>let ws;let rawSeq=0;let deviceSeq=0;let statusSeq=0;let actionBusy=0;function setText(id,val){document.getElementById(id).textContent=val||'-';}function setStatus(text,kind=''){const el=document.getElementById('statusLine');el.textContent=text||'';el.className='status-line'+(kind?(' '+kind):'');}function setBusy(flag){actionBusy+=flag?1:-1;if(actionBusy<0)actionBusy=0;document.querySelectorAll('button').forEach(btn=>btn.disabled=actionBusy>0&&btn.textContent!=='退出登录');}function setRawText(text){const box=document.getElementById('raw');box.textContent=text||'';box.scrollTop=box.scrollHeight;}function appendRaw(line,seq){if(seq&&seq<=rawSeq)return;if(seq)rawSeq=seq;const box=document.getElementById('raw');box.textContent+=(box.textContent?'\n':'')+line;box.scrollTop=box.scrollHeight;}function setDeviceState(state,seq){if(seq&&seq<deviceSeq)return;if(seq)deviceSeq=seq;setText('phone',state.phone_number);setText('identity',state.identity_type);setText('operator',state.operator);setText('signal',state.signal_strength);setText('temp',state.temperature);setText('reason',state.poweron_reason_zh);setText('updatedAt',state.updated_at);const badge=document.getElementById('deviceStateBadge');badge.textContent='下位机'+(state.status||'-');badge.className='badge '+((state.status||'').includes('在线')?'ok':'bad');}async function api(path,opts={}){opts.cache='no-store';const res=await fetch(path,opts);let data={ok:false};try{data=await res.json();}catch(e){}if(res.status===401){location.href='/';throw new Error('未登录或会话已失效');}if(!res.ok||data.ok===false&&data.error){throw new Error(data.error||('HTTP '+res.status));}return data;}async function runAction(text,fn){setBusy(true);setStatus(text);try{return await fn();}catch(e){setStatus('操作失败：'+(e&&e.message?e.message:e),'error');throw e;}finally{setBusy(false);}}function applySnapshot(data){if(data.raw_seq&&data.raw_seq>=rawSeq){rawSeq=data.raw_seq;setRawText(data.raw_log||'');}if(data.status_seq&&data.status_seq>=statusSeq){statusSeq=data.status_seq;setStatus(data.last_status||'已同步快照',data.last_status?'ok':'');}if(data.device_state)setDeviceState(data.device_state,data.device_seq||0);document.getElementById('wifiState').textContent='WiFi '+(data.wifi_ip||'-');document.getElementById('barkEnabled').checked=!!(data.bark&&data.bark.enabled);document.getElementById('barkApi').value=(data.bark&&data.bark.api)||'';document.getElementById('barkKey').value=(data.bark&&data.bark.key)||'';}async function loadSnapshot(){const data=await api('/api/snapshot');applySnapshot(data);}async function refreshStatus(){await runAction('正在发送状态请求...',()=>api('/api/action/status',{method:'POST'}));setStatus('已发送状态请求，等待下位机回复','ok');}async function syncTimeNow(){await runAction('正在同步时间...',()=>api('/api/action/sync-time',{method:'POST'}));setStatus('已发送时间同步命令','ok');}async function rebootDownstream(){if(!confirm('确认重启下位机？'))return;await runAction('正在发送重启命令...',()=>api('/api/action/reboot',{method:'POST'}));setStatus('已发送重启命令','ok');}async function clearRawLog(){await runAction('正在清空日志...',()=>api('/api/raw/clear',{method:'POST'}));rawSeq=0;setRawText('');setStatus('日志已清空','ok');}async function saveBark(){const params=new URLSearchParams();params.set('enabled',document.getElementById('barkEnabled').checked?'true':'false');params.set('api',document.getElementById('barkApi').value.trim());params.set('key',document.getElementById('barkKey').value.trim());await runAction('正在保存 Bark 配置...',()=>api('/api/bark/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:params.toString()}));await loadSnapshot();setStatus('Bark 配置已保存','ok');}async function testBark(){await runAction('正在发送 Bark 测试...',()=>api('/api/bark/test',{method:'POST'}));await loadSnapshot();setStatus('Bark 测试已触发，请查看日志','ok');}async function savePassword(){const p1=document.getElementById('newPassword').value.trim();const p2=document.getElementById('confirmPassword').value.trim();if(!p1){setStatus('新密码不能为空','error');return;}if(p1!==p2){setStatus('两次输入的新密码不一致','error');return;}const params=new URLSearchParams();params.set('password',p1);await runAction('正在保存网页密码...',()=>api('/api/auth/password',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:params.toString()}));document.getElementById('newPassword').value='';document.getElementById('confirmPassword').value='';setStatus('网页密码已更新','ok');}function presetCommand(type){if(type==='status'){document.getElementById('commandText').value='{\"cmd\":\"get_status\"}';return;}const d=new Date();document.getElementById('commandText').value=JSON.stringify({cmd:'sync_time',source:'esp32_web',clock:{year:d.getFullYear(),month:d.getMonth()+1,day:d.getDate(),hour:d.getHours(),min:d.getMinutes(),sec:d.getSeconds()},host_timestamp:d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0')});}async function sendCommand(){const line=document.getElementById('commandText').value.trim();if(!line){setStatus('命令不能为空','error');return;}const params=new URLSearchParams();params.set('line',line);await runAction('正在发送原始命令...',()=>api('/api/action/send-command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:params.toString()}));setStatus('原始命令已发送','ok');}async function logout(){try{await fetch('/api/auth/logout',{method:'POST',cache:'no-store'});}catch(e){}location.href='/';}function initWs(){ws=new WebSocket(`ws://${location.hostname}:81/`);ws.onopen=()=>{const el=document.getElementById('wsState');el.textContent='WebSocket 已连接';el.className='badge ok';};ws.onclose=()=>{const el=document.getElementById('wsState');el.textContent='WebSocket 断开，重连中';el.className='badge bad';setTimeout(initWs,2000);};ws.onmessage=(ev)=>{try{const msg=JSON.parse(ev.data);if(msg.type==='raw_log')appendRaw(msg.line,msg.seq||0);else if(msg.type==='device_state')setDeviceState(msg.state||{},msg.seq||0);else if(msg.type==='status'){if((msg.seq||0)>=statusSeq){statusSeq=msg.seq||statusSeq;setStatus(msg.text||'','ok');}}}catch(e){appendRaw(ev.data,0);}};}loadSnapshot().catch(e=>setStatus('加载初始数据失败：'+e.message,'error'));initWs();</script></body></html>
+<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Air724UG Web Monitor</title><style>:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;font-family:"Microsoft YaHei UI",sans-serif;background:#0f1115;color:#e8eaed}.wrap{max-width:1180px;margin:0 auto;padding:16px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}.badge{padding:6px 10px;border-radius:999px;background:#1f2937;color:#cbd5e1;font-size:12px}.ok{background:#12361f;color:#86efac}.bad{background:#3a1616;color:#fca5a5}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:16px}.card{background:#171a21;border:1px solid #2a2f3a;border-radius:12px;padding:14px}.card h3{margin:0 0 10px;font-size:15px}.kv{display:grid;grid-template-columns:88px 1fr;gap:8px;font-size:14px;line-height:1.7}input,button,textarea{border-radius:8px;border:1px solid #394150;background:#0d1117;color:#e8eaed;padding:10px;font-size:14px}input,textarea{width:100%}button{cursor:pointer;background:#2563eb;border-color:#2563eb}button.secondary{background:#374151;border-color:#374151}button.warn{background:#b91c1c;border-color:#b91c1c}button:disabled{opacity:.55;cursor:not-allowed}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.status-line{margin-top:12px;padding:10px 12px;border-radius:10px;background:#111827;color:#cbd5e1;font-size:13px}.status-line.error{background:#3a1616;color:#fecaca}.status-line.ok{background:#12361f;color:#bbf7d0}#raw{height:360px;overflow:auto;white-space:pre-wrap;word-break:break-all;background:#05070b;border:1px solid #2a2f3a;border-radius:12px;padding:12px;font-family:Consolas,monospace}.muted{color:#94a3b8;font-size:12px}textarea{min-height:96px;resize:vertical}</style></head><body><div class="wrap"><div class="top"><div><h2 style="margin:0">Air724UG Web Monitor</h2><div class="muted">ESP32-C3 UART 网关 · GPIO20 RX / GPIO21 TX</div></div><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><span class="badge" id="wifiState">WiFi -</span><span class="badge bad" id="wsState">WebSocket 未连接</span><span class="badge" id="deviceStateBadge">下位机离线</span><button class="secondary" style="padding:8px 12px" onclick="logout()">退出登录</button></div></div><div id="statusLine" class="status-line">页面已加载，等待设备状态...</div><div class="grid"><div class="card"><h3>设备状态</h3><div class="kv"><div>号码/ICCID</div><div id="phone">-</div><div>身份类型</div><div id="identity">-</div><div>运营商</div><div id="operator">-</div><div>信号</div><div id="signal">-</div><div>温度</div><div id="temp">-</div><div>启动原因</div><div id="reason">-</div><div>更新时间</div><div id="updatedAt">-</div><div>最后接收</div><div id="lastRx">-</div><div>最后请求</div><div id="lastStatusReq">-</div><div>最后回复</div><div id="lastStatusReply">-</div><div>请求状态</div><div id="statusPending">-</div><div>Bark队列</div><div id="barkQueue">-</div></div><div class="actions"><button id="btnRefresh" onclick="refreshStatus()">刷新状态</button><button id="btnSyncTime" class="secondary" onclick="syncTimeNow()">同步时间</button><button id="btnReboot" class="warn" onclick="rebootDownstream()">重启下位机</button></div></div><div class="card"><h3>Bark 配置</h3><label class="muted"><input type="checkbox" id="barkEnabled" style="width:auto;margin-right:8px">启用短信/来电转发</label><div style="height:10px"></div><input id="barkApi" placeholder="BARK_API，例如 https://bark.256404.xyz"><div style="height:10px"></div><input id="barkKey" placeholder="BARK_KEY"><div class="actions"><button id="btnSaveBark" onclick="saveBark()">保存 Bark</button><button id="btnTestBark" class="secondary" onclick="testBark()">测试 Bark</button></div></div><div class="card"><h3>网页密码</h3><div class="muted">修改后立即生效，当前会话保持登录</div><div style="height:10px"></div><input id="newPassword" type="password" placeholder="新密码"><div style="height:10px"></div><input id="confirmPassword" type="password" placeholder="确认新密码"><div class="actions"><button id="btnSavePassword" onclick="savePassword()">保存密码</button></div></div><div class="card"><h3>原始命令</h3><div class="muted">用于联调下位机，支持直接发送 JSON 行</div><div style="height:10px"></div><textarea id="commandText" spellcheck="false">{&quot;cmd&quot;:&quot;get_status&quot;}</textarea><div class="actions"><button id="btnSendCommand" onclick="sendCommand()">发送命令</button><button class="secondary" onclick="presetCommand('status')">填入 get_status</button><button class="secondary" onclick="presetCommand('time')">填入 sync_time</button></div></div></div><div class="card" style="margin-top:16px"><div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap"><h3 style="margin:0">原始日志</h3><div class="actions" style="margin-top:0"><button class="secondary" onclick="clearRawLog()">清空日志</button></div></div><div class="muted" style="margin:8px 0 12px">显示 UART 收发、状态消息和 Bark 结果</div><div id="raw"></div></div></div><script>let ws;let rawSeq=0;let deviceSeq=0;let statusSeq=0;let actionBusy=0;function setText(id,val){document.getElementById(id).textContent=val||'-';}function setStatus(text,kind=''){const el=document.getElementById('statusLine');el.textContent=text||'';el.className='status-line'+(kind?(' '+kind):'');}function setBusy(flag){actionBusy+=flag?1:-1;if(actionBusy<0)actionBusy=0;document.querySelectorAll('button').forEach(btn=>btn.disabled=actionBusy>0&&btn.textContent!=='退出登录');}function setRawText(text){const box=document.getElementById('raw');box.textContent=text||'';box.scrollTop=box.scrollHeight;}function appendRaw(line,seq){if(seq&&seq<=rawSeq)return;if(seq)rawSeq=seq;const box=document.getElementById('raw');box.textContent+=(box.textContent?'\n':'')+line;box.scrollTop=box.scrollHeight;}function setDeviceState(state,seq){if(seq&&seq<deviceSeq)return;if(seq)deviceSeq=seq;setText('phone',state.phone_number);setText('identity',state.identity_type);setText('operator',state.operator);setText('signal',state.signal_strength);setText('temp',state.temperature);setText('reason',state.poweron_reason_zh);setText('updatedAt',state.updated_at);const badge=document.getElementById('deviceStateBadge');badge.textContent='下位机'+(state.status||'-');badge.className='badge '+((state.status||'').includes('在线')?'ok':'bad');}function fmtMs(v){if(v===undefined||v===null||v<0)return'-';if(v<1000)return v+'ms';const s=Math.floor(v/1000);if(s<60)return s+'s';const m=Math.floor(s/60);return m+'m '+(s%60)+'s';}function setDiagnostics(d){setText('lastRx',fmtMs(d.last_uart_rx_ago_ms));setText('lastStatusReq',fmtMs(d.last_status_request_ago_ms)+(d.status_request_id?(' · '+d.status_request_id):''));setText('lastStatusReply',fmtMs(d.last_status_reply_ago_ms)+(d.last_status_reply_id?(' · '+d.last_status_reply_id):''));setText('statusPending',d.status_request_pending?'等待回复':'空闲');setText('barkQueue',(d.bark_queue_count||0)+'/'+(d.bark_queue_size||0)+' · 已发 '+(d.bark_sent_seq||0));}async function api(path,opts={}){opts.cache='no-store';const res=await fetch(path,opts);let data={ok:false};try{data=await res.json();}catch(e){}if(res.status===401){location.href='/';throw new Error('未登录或会话已失效');}if(!res.ok||data.ok===false&&data.error){throw new Error(data.error||('HTTP '+res.status));}return data;}async function runAction(text,fn){setBusy(true);setStatus(text);try{return await fn();}catch(e){setStatus('操作失败：'+(e&&e.message?e.message:e),'error');throw e;}finally{setBusy(false);}}function applySnapshot(data){if(data.raw_seq&&data.raw_seq>=rawSeq){rawSeq=data.raw_seq;setRawText(data.raw_log||'');}if(data.status_seq&&data.status_seq>=statusSeq){statusSeq=data.status_seq;setStatus(data.last_status||'已同步快照',data.last_status?'ok':'');}if(data.device_state)setDeviceState(data.device_state,data.device_seq||0);if(data.diagnostics)setDiagnostics(data.diagnostics);document.getElementById('wifiState').textContent='WiFi '+(data.wifi_ip||'-');document.getElementById('barkEnabled').checked=!!(data.bark&&data.bark.enabled);document.getElementById('barkApi').value=(data.bark&&data.bark.api)||'';document.getElementById('barkKey').value=(data.bark&&data.bark.key)||'';}async function loadSnapshot(){const data=await api('/api/snapshot');applySnapshot(data);}async function refreshStatus(){const data=await runAction('正在发送状态请求...',()=>api('/api/action/status',{method:'POST'}));setStatus(data.sent?'已发送状态请求，等待下位机回复':'状态请求已跳过：已有请求或间隔过短','ok');await loadSnapshot();}async function syncTimeNow(){await runAction('正在同步时间...',()=>api('/api/action/sync-time',{method:'POST'}));setStatus('已发送时间同步命令','ok');}async function rebootDownstream(){if(!confirm('确认重启下位机？'))return;await runAction('正在发送重启命令...',()=>api('/api/action/reboot',{method:'POST'}));setStatus('已发送重启命令','ok');}async function clearRawLog(){await runAction('正在清空日志...',()=>api('/api/raw/clear',{method:'POST'}));rawSeq=0;setRawText('');setStatus('日志已清空','ok');}async function saveBark(){const params=new URLSearchParams();params.set('enabled',document.getElementById('barkEnabled').checked?'true':'false');params.set('api',document.getElementById('barkApi').value.trim());params.set('key',document.getElementById('barkKey').value.trim());await runAction('正在保存 Bark 配置...',()=>api('/api/bark/save',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:params.toString()}));await loadSnapshot();setStatus('Bark 配置已保存','ok');}async function testBark(){await runAction('正在加入 Bark 测试队列...',()=>api('/api/bark/test',{method:'POST'}));await loadSnapshot();setStatus('Bark 测试已加入队列，请查看日志','ok');}async function savePassword(){const p1=document.getElementById('newPassword').value.trim();const p2=document.getElementById('confirmPassword').value.trim();if(!p1){setStatus('新密码不能为空','error');return;}if(p1!==p2){setStatus('两次输入的新密码不一致','error');return;}const params=new URLSearchParams();params.set('password',p1);await runAction('正在保存网页密码...',()=>api('/api/auth/password',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:params.toString()}));document.getElementById('newPassword').value='';document.getElementById('confirmPassword').value='';setStatus('网页密码已更新','ok');}function presetCommand(type){if(type==='status'){document.getElementById('commandText').value='{\"cmd\":\"get_status\"}';return;}const d=new Date();document.getElementById('commandText').value=JSON.stringify({cmd:'sync_time',source:'esp32_web',clock:{year:d.getFullYear(),month:d.getMonth()+1,day:d.getDate(),hour:d.getHours(),min:d.getMinutes(),sec:d.getSeconds()},host_timestamp:d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0')+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0')+':'+String(d.getSeconds()).padStart(2,'0')});}async function sendCommand(){const line=document.getElementById('commandText').value.trim();if(!line){setStatus('命令不能为空','error');return;}const params=new URLSearchParams();params.set('line',line);await runAction('正在发送原始命令...',()=>api('/api/action/send-command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},body:params.toString()}));setStatus('原始命令已发送','ok');}async function logout(){try{await fetch('/api/auth/logout',{method:'POST',cache:'no-store'});}catch(e){}location.href='/';}function initWs(){ws=new WebSocket(`ws://${location.hostname}:81/`);ws.onopen=()=>{const el=document.getElementById('wsState');el.textContent='WebSocket 已连接';el.className='badge ok';};ws.onclose=()=>{const el=document.getElementById('wsState');el.textContent='WebSocket 断开，重连中';el.className='badge bad';setTimeout(initWs,2000);};ws.onmessage=(ev)=>{try{const msg=JSON.parse(ev.data);if(msg.type==='raw_log')appendRaw(msg.line,msg.seq||0);else if(msg.type==='device_state')setDeviceState(msg.state||{},msg.seq||0);else if(msg.type==='status'){if((msg.seq||0)>=statusSeq){statusSeq=msg.seq||statusSeq;setStatus(msg.text||'','ok');}}}catch(e){appendRaw(ev.data,0);}};}loadSnapshot().catch(e=>setStatus('加载初始数据失败：'+e.message,'error'));initWs();</script></body></html>
 )rawliteral";
 }
 
@@ -466,12 +570,31 @@ void handleAuthPasswordSave() {
 }
 void handleSnapshot() {
   if (!ensureAuthenticated()) return;
+  unsigned long now = millis();
   String wifiIp = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "未连接";
-  String json = String("{") + "\"ok\":true," + "\"wifi_ip\":\"" + jsonEscape(wifiIp) + "\"," + "\"raw_log\":\"" + jsonEscape(rawLogBuffer) + "\"," + "\"raw_seq\":" + String(rawLogSeq) + "," + "\"device_state\":" + deviceStateJson() + "," + "\"device_seq\":" + String(deviceStateSeq) + "," + "\"last_status\":\"" + jsonEscape(lastStatusMessage) + "\"," + "\"status_seq\":" + String(statusSeq) + "," + "\"bark\":{" + "\"enabled\":" + String(barkConfig.enabled ? "true" : "false") + "," + "\"api\":\"" + jsonEscape(barkConfig.api) + "\"," + "\"key\":\"" + jsonEscape(barkConfig.key) + "\"}}";
+  String diagnostics = String("{") +
+                       "\"uptime_ms\":" + String(now) + "," +
+                       "\"last_uart_rx_ago_ms\":" + String(elapsedMsOrMinusOne(lastDownstreamMessageMs, now)) + "," +
+                       "\"last_uart_tx_ago_ms\":" + String(elapsedMsOrMinusOne(lastDownstreamCommandMs, now)) + "," +
+                       "\"last_status_request_ago_ms\":" + String(elapsedMsOrMinusOne(lastStatusRequestMs, now)) + "," +
+                       "\"last_status_reply_ago_ms\":" + String(elapsedMsOrMinusOne(lastStatusReplyMs, now)) + "," +
+                       "\"status_request_pending\":" + String(statusRequestPending ? "true" : "false") + "," +
+                       "\"status_request_id\":\"" + jsonEscape(currentStatusRequestId) + "\"," +
+                       "\"last_status_reply_id\":\"" + jsonEscape(lastStatusReplyId) + "\"," +
+                       "\"bark_queue_count\":" + String(barkQueueCount) + "," +
+                       "\"bark_queue_size\":" + String(BARK_QUEUE_SIZE) + "," +
+                       "\"bark_enqueued_seq\":" + String(barkEnqueuedSeq) + "," +
+                       "\"bark_sent_seq\":" + String(barkSentSeq) +
+                       "}";
+  String json = String("{") + "\"ok\":true," + "\"wifi_ip\":\"" + jsonEscape(wifiIp) + "\"," + "\"raw_log\":\"" + jsonEscape(rawLogBuffer) + "\"," + "\"raw_seq\":" + String(rawLogSeq) + "," + "\"device_state\":" + deviceStateJson() + "," + "\"device_seq\":" + String(deviceStateSeq) + "," + "\"last_status\":\"" + jsonEscape(lastStatusMessage) + "\"," + "\"status_seq\":" + String(statusSeq) + "," + "\"diagnostics\":" + diagnostics + "," + "\"bark\":{" + "\"enabled\":" + String(barkConfig.enabled ? "true" : "false") + "," + "\"api\":\"" + jsonEscape(barkConfig.api) + "\"," + "\"key\":\"" + jsonEscape(barkConfig.key) + "\"}}";
   sendNoCacheHeaders();
   server.send(200, "application/json; charset=utf-8", json);
 }
-void handleActionStatus() { if (!ensureAuthenticated()) return; requestDeviceStatus(); server.send(200, "application/json", "{\"ok\":true}"); }
+void handleActionStatus() {
+  if (!ensureAuthenticated()) return;
+  bool sent = requestDeviceStatus();
+  server.send(200, "application/json", sent ? "{\"ok\":true,\"sent\":true}" : "{\"ok\":true,\"sent\":false,\"message\":\"status request skipped\"}");
+}
 void handleActionSyncTime() { if (!ensureAuthenticated()) return; sendTimeSync(); server.send(200, "application/json", "{\"ok\":true}"); }
 void handleActionReboot() { if (!ensureAuthenticated()) return; sendRebootCommand(); server.send(200, "application/json", "{\"ok\":true}"); }
 void handleActionSendCommand() {
@@ -504,7 +627,11 @@ void handleBarkSave() {
   publishStatusMessage("已保存 Bark 配置");
   server.send(200, "application/json", "{\"ok\":true}");
 }
-void handleBarkTest() { if (!ensureAuthenticated()) return; sendBark("Bark 测试消息\n\n#TEST_BARK", true); server.send(200, "application/json", "{\"ok\":true}"); }
+void handleBarkTest() {
+  if (!ensureAuthenticated()) return;
+  bool queued = enqueueBark("Bark 测试消息\n\n#TEST_BARK", true);
+  server.send(200, "application/json", queued ? "{\"ok\":true,\"queued\":true}" : "{\"ok\":false,\"error\":\"bark queue full\"}");
+}
 void handleNotFound() { server.send(404, "application/json", "{\"ok\":false,\"error\":\"not found\"}"); }
 
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
@@ -556,7 +683,8 @@ void setup() {
   webSocket.onEvent(webSocketEvent);
   publishStatusMessage("服务已就绪，请在浏览器访问当前 IP 地址");
   sendTimeSync();
-  requestDeviceStatus();
+  delay(200);
+  requestDeviceStatus(true);
   lastTimeSyncMs = millis();
   lastStatusPollMs = millis();
 }
@@ -565,8 +693,9 @@ void loop() {
   server.handleClient();
   webSocket.loop();
   handleUartReceive();
+  processBarkQueue();
   unsigned long now = millis();
   if (now - lastTimeSyncMs >= HOST_TIME_SYNC_INTERVAL_MS) { sendTimeSync(); lastTimeSyncMs = now; }
-  if (now - lastStatusPollMs >= STATUS_POLL_INTERVAL_MS) { requestDeviceStatus(); lastStatusPollMs = now; }
-  if (downstreamOnline && now - lastDownstreamMessageMs > 30000UL) { downstreamOnline = false; publishDeviceState(); }
+  if (now - lastStatusPollMs >= STATUS_POLL_INTERVAL_MS) { requestDeviceStatus(); }
+  if (downstreamOnline && now - lastDownstreamMessageMs > DOWNSTREAM_OFFLINE_TIMEOUT_MS) { downstreamOnline = false; publishDeviceState(); }
 }
